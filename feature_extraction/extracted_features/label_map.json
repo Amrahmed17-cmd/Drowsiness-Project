@@ -1,4 +1,4 @@
 {
-  "0": "non_drowsy",
-  "1": "drowsy"
+  "drowsy": 1,
+  "non_drowsy": 0
 }
