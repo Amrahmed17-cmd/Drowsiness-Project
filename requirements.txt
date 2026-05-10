@@ -1,0 +1,15 @@
+# --- Core compatibility set for TF 2.10 + MediaPipe FaceMesh on Windows ---
+# Pinned together because they have hard cross-version constraints:
+#   - tensorflow 2.10 is the LAST native-Windows GPU build (do not bump)
+#   - tensorflow 2.10 needs protobuf < 3.20.x and numpy < 2.x
+#   - mediapipe >= 0.10.10 forces protobuf >= 4.25.3, which breaks TF 2.10
+#     ("TypeError: Descriptors cannot be created directly")
+# mediapipe 0.10.9 is the newest release that still allows protobuf 3.20.x
+# AND still exposes the legacy `mp.solutions.face_mesh` API used in the notebook.
+tensorflow==2.10.0
+numpy==1.26.4
+protobuf==3.20.3
+mediapipe==0.10.9
+attrs>=19.1.0
+opencv-contrib-python==4.10.0.84
+matplotlib==3.10.0
