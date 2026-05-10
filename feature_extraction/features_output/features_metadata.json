@@ -1,0 +1,9 @@
+{
+  "train_samples": 22205,
+  "test_samples": 5568,
+  "feature_dim": 1282,
+  "train_skipped": 215,
+  "test_skipped": 37,
+  "img_size": 256,
+  "date": "2026-05-09T21:21:37.003731"
+}

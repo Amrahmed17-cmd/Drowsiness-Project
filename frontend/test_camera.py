@@ -1,6 +1,6 @@
 import cv2
 
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # open default webcam
 
 while True:
     ret, frame = cap.read()
@@ -10,7 +10,7 @@ while True:
 
     cv2.imshow("Test Camera", frame)
 
-    if cv2.waitKey(1) == 27:  # ESC key
+    if cv2.waitKey(1) == 27:  # ESC to quit
         break
 
 cap.release()

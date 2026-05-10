@@ -8,19 +8,13 @@ FRAME_HEIGHT = 480
 TARGET_FPS   = 30
 
 
-_camera = None  # opened lazily on first read_frame()
+_camera = None  # opened lazily on first read
 
 
 def _open_camera():
-    """
-    Open the webcam with a sensible backend per platform.
-
-    On Windows the default MSMF backend is sometimes slow to open or
-    flaky with USB cams, so we try DirectShow first.
-    """
     backends = []
     if sys.platform.startswith("win"):
-        backends.append(cv2.CAP_DSHOW)
+        backends.append(cv2.CAP_DSHOW)  # DirectShow first on Windows
     backends.append(cv2.CAP_ANY)
 
     last_err = None
@@ -34,8 +28,7 @@ def _open_camera():
             cam.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
             cam.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
             cam.set(cv2.CAP_PROP_FPS,          TARGET_FPS)
-            # Keep only the latest frame so we never lag behind the camera.
-            cam.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+            cam.set(cv2.CAP_PROP_BUFFERSIZE,   1)  # keep only the latest frame
             return cam
         if cam is not None:
             cam.release()
@@ -54,10 +47,6 @@ def _get_camera():
 
 
 def read_frame():
-    """
-    Returns the next BGR frame from the webcam, or None if the read fails.
-    The camera is opened on the first call.
-    """
     cam = _get_camera()
     success, frame = cam.read()
     if not success or frame is None:
@@ -66,7 +55,6 @@ def read_frame():
 
 
 def close_camera():
-    """Release the webcam. Safe to call multiple times."""
     global _camera
     if _camera is not None:
         if _camera.isOpened():

@@ -1,24 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════════╗
-║       DrowsinessDetection — run_app.py                  ║
-║       Launch the Streamlit GUI from any working dir     ║
-╚══════════════════════════════════════════════════════════╝
-
-Usage
------
-    python frontend/run_app.py               # default port 8501
-    python frontend/run_app.py --port 8888   # custom port
-    python frontend/run_app.py --no-browser  # headless / server mode
-
-What this script does
----------------------
-  1. Resolves the absolute path to frontend/app.py
-  2. Generates a temporary Streamlit config so the UI looks
-     exactly right (dark theme, wide layout, no menu bar)
-  3. Calls `streamlit run` via subprocess from the project root,
-     so the GUI can import `src.realtime.pipeline` without any
-     extra PYTHONPATH gymnastics.
-"""
 
 from __future__ import annotations
 
@@ -30,13 +9,11 @@ import textwrap
 import tempfile
 from pathlib import Path
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
 FRONTEND_DIR = Path(__file__).resolve().parent
 PROJECT_DIR  = FRONTEND_DIR.parent
 APP_PATH     = FRONTEND_DIR / "app.py"
 
 
-# ── Streamlit config (injected via env, no .streamlit/config.toml needed) ────
 STREAMLIT_CONFIG = textwrap.dedent("""
     [global]
     developmentMode = false
@@ -60,12 +37,11 @@ STREAMLIT_CONFIG = textwrap.dedent("""
 
 
 def _write_temp_config() -> Path:
-    """Write Streamlit config to a temp file and return its directory."""
     tmp_dir = Path(tempfile.mkdtemp()) / ".streamlit"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     config_file = tmp_dir / "config.toml"
     config_file.write_text(STREAMLIT_CONFIG, encoding="utf-8")
-    return tmp_dir.parent   # the dir that contains .streamlit/
+    return tmp_dir.parent  # parent dir holding .streamlit/
 
 
 def main() -> None:
@@ -83,24 +59,21 @@ def main() -> None:
     parser.add_argument("--no-browser", action="store_true",    help="Do not open browser automatically")
     args = parser.parse_args()
 
-    # ── Pre-flight checks ───────────────────────────────────────────────────
     if not APP_PATH.exists():
         print(f"\n[ERROR] app.py not found at:\n  {APP_PATH}\n")
         sys.exit(1)
 
     try:
-        import streamlit  # noqa: F401
+        import streamlit
     except ImportError:
         print("\n[ERROR] Streamlit is not installed.")
         print("  Run:  pip install -r requirements.txt\n")
         sys.exit(1)
 
-    # ── Config ─────────────────────────────────────────────────────────────
     config_dir = _write_temp_config()
     env = os.environ.copy()
-    env["STREAMLIT_CONFIG_DIR"] = str(config_dir / ".streamlit")
+    env["STREAMLIT_CONFIG_DIR"] = str(config_dir / ".streamlit")  # inject config
 
-    # ── Build command ───────────────────────────────────────────────────────
     cmd = [
         sys.executable, "-m", "streamlit", "run",
         str(APP_PATH),
@@ -109,9 +82,8 @@ def main() -> None:
         "--theme.base", "dark",
     ]
     if not args.no_browser:
-        cmd += ["--server.headless", "false"]
+        cmd += ["--server.headless", "false"]  # auto-open browser
 
-    # ── Launch ─────────────────────────────────────────────────────────────
     print("=" * 60)
     print("  Drowsiness Detection System")
     print(f"  URL:  http://localhost:{args.port}")
@@ -120,7 +92,7 @@ def main() -> None:
     print("  Press Ctrl+C to stop\n")
 
     try:
-        subprocess.run(cmd, env=env, cwd=str(PROJECT_DIR), check=True)
+        subprocess.run(cmd, env=env, cwd=str(PROJECT_DIR), check=True)  # launch Streamlit
     except KeyboardInterrupt:
         print("\n\n  [INFO] Server stopped by user.\n")
     except subprocess.CalledProcessError as e:

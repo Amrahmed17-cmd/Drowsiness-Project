@@ -1,19 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════════════════╗
-║         Real-Time Drowsiness Detection System — app.py          ║
-║         Streamlit GUI  |  OpenCV  |  No background thread       ║
-║         Theme: Navy · Burgundy · Purple  (glassmorphism)        ║
-╚══════════════════════════════════════════════════════════════════╝
-
-Backend
--------
-  Uses the same pipeline as `scripts/run_realtime.py`:
-      MediaPipe FaceLandmarker  →  CLAHE/bilateral pre-processing
-      →  MobileNetV2 deep features + EAR features
-      →  StandardScaler  →  SVM classifier
-  Predictions are smoothed over the last SMOOTH_WINDOW frames; the GUI's
-  0-100 fatigue score is the smoothed "drowsy fraction" × 100.
-"""
 
 from __future__ import annotations
 
@@ -28,23 +12,17 @@ import cv2
 import numpy as np
 import streamlit as st
 
-# ── Make the project root importable so `from src.realtime.pipeline import …`
-#    works regardless of the cwd Streamlit was launched from. ─────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+    sys.path.insert(0, str(PROJECT_ROOT))   # so `from src.realtime...` works
 
-# ── Optional audio ────────────────────────────────────────────────────────────
 try:
     import pygame
     pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=512)
     AUDIO_BACKEND = "pygame"
 except Exception:
-    AUDIO_BACKEND = "none"
+    AUDIO_BACKEND = "none"   # fallback: no audio
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PAGE CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Drowsiness Detection System",
     page_icon="👁️",
@@ -52,22 +30,16 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────────────────────────────────────
 FRAME_WIDTH        = 640
 FRAME_HEIGHT       = 480
-ALERT_COOLDOWN_SEC = 3.0
+ALERT_COOLDOWN_SEC = 3.0    # min seconds between audio alerts
 ASSETS_DIR         = Path(__file__).parent / "assets"
 ALERT_SOUND        = ASSETS_DIR / "alert.wav"
 
-# Smoothing — must match scripts/run_realtime.py so behaviour is identical.
-SMOOTH_WINDOW    = 10    # number of recent frames blended into the score
-DROWSY_THRESHOLD = 0.5   # drowsy-fraction above which state flips to "Drowsy"
+SMOOTH_WINDOW      = 30     # frames in the rolling vote window
+ENTER_DROWSY_FRAC  = 0.55   # vote ratio to flag Drowsy
+EXIT_DROWSY_FRAC   = 0.30   # vote ratio to leave Drowsy (hysteresis)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CSS  —  Navy · Burgundy · Purple glassmorphism theme
-# ─────────────────────────────────────────────────────────────────────────────
 CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=Share+Tech+Mono&family=Exo+2:wght@300;400;600;800&display=swap');
@@ -401,9 +373,6 @@ div[data-testid="column"]:nth-child(2) .stButton > button:hover {
 </style>
 """
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SESSION STATE INIT
-# ─────────────────────────────────────────────────────────────────────────────
 def _init_state():
     defaults = {
         "running":         False,
@@ -420,13 +389,18 @@ def _init_state():
         "fps_counter":     0,
         "fps_t0":          0.0,
         "session_t0":      0.0,
-        # Pipeline state ----------------------------------------------------
-        "drowsy_buffer":   deque(maxlen=SMOOTH_WINDOW),  # 1 = drowsy frame
-        "last_ear":        None,
-        "last_ear_diff":   None,
-        "last_raw_label":  None,
-        "no_face_streak":  0,
-        "prev_status":     "Idle",
+        "drowsy_buffer":      deque(maxlen=SMOOTH_WINDOW),
+        "last_ear":           None,
+        "last_ear_diff":      None,
+        "last_raw_label":     None,
+        "last_head_pose":     None,
+        "last_head_pose_rel": None,
+        "head_off_streak":    0,
+        "is_head_drowsy":     False,
+        "calibrating":        False,
+        "calibration_progress": 0.0,
+        "no_face_streak":     0,
+        "prev_status":        "Idle",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -434,18 +408,13 @@ def _init_state():
 
 _init_state()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PIPELINE — DrowsinessPipeline (MediaPipe + MobileNetV2 + SVM)
-# Cached so the model loads once and is reused across Streamlit reruns.
-# ─────────────────────────────────────────────────────────────────────────────
 _PIPELINE_LOAD_ERROR: Optional[str] = None
 
 
-@st.cache_resource(
+@st.cache_resource(   # load model once across reruns
     show_spinner="Loading drowsiness pipeline (MediaPipe + MobileNetV2 + SVM)…",
 )
 def get_pipeline():
-    """Instantiate the real DrowsinessPipeline once; return None on failure."""
     global _PIPELINE_LOAD_ERROR
     try:
         from src.realtime.pipeline import DrowsinessPipeline
@@ -457,23 +426,11 @@ def get_pipeline():
 
 
 def _real_pipeline(frame: np.ndarray) -> tuple[str, int]:
-    """
-    Run the real DrowsinessPipeline on a BGR frame and return (status, score).
-
-      status ∈ {"Drowsy", "Awake", "No Face"}
-      score  ∈ [0, 100]   # smoothed drowsy fraction × 100
-
-    Mirrors the smoothing logic in scripts/run_realtime.py: a frame is
-    classified raw, pushed into a length-SMOOTH_WINDOW buffer, and the
-    state is "Drowsy" iff the buffer's drowsy fraction exceeds
-    DROWSY_THRESHOLD. When no face is detected the buffer is left
-    untouched so the smoothed state stays stable across brief misses.
-    """
     pipeline = get_pipeline()
     if pipeline is None:
         return "Error", 0
 
-    result = pipeline.process(frame)
+    result = pipeline.process(frame)            # eye + head-pose inference
     buf    = st.session_state.drowsy_buffer
 
     if result is None:
@@ -481,26 +438,39 @@ def _real_pipeline(frame: np.ndarray) -> tuple[str, int]:
         st.session_state.last_raw_label  = None
         if not buf:
             return "No Face", 0
-        # Otherwise fall through and reuse whatever's already in the buffer.
     else:
-        st.session_state.no_face_streak  = 0
-        buf.append(1 if result["is_drowsy"] else 0)
-        st.session_state.last_ear        = result["ear"]
-        st.session_state.last_ear_diff   = result["ear_diff"]
-        st.session_state.last_raw_label  = result["label"]
+        st.session_state.no_face_streak       = 0
+        st.session_state.last_ear             = result["ear"]
+        st.session_state.last_ear_diff        = result["ear_diff"]
+        st.session_state.last_raw_label       = result["label"]
+        st.session_state.last_head_pose       = result["head_pose"]
+        st.session_state.last_head_pose_rel   = result["head_pose_relative"]
+        st.session_state.head_off_streak      = result["head_off_streak"]
+        st.session_state.is_head_drowsy       = result["is_head_drowsy"]
+        st.session_state.calibrating          = result["calibrating"]
+        st.session_state.calibration_progress = result["calibration_progress"]
+
+        if result["calibrating"]:
+            return "Calibrating", 0    # don't vote until baseline locked in
+
+        frame_drowsy = bool(result["is_drowsy"]) or bool(result["is_head_drowsy"])  # eye OR head
+        buf.append(1 if frame_drowsy else 0)
 
     drowsy_score = sum(buf) / len(buf) if buf else 0.0
-    score_int    = int(round(drowsy_score * 100))
-    status       = "Drowsy" if drowsy_score > DROWSY_THRESHOLD else "Awake"
-    return status, score_int
+    score_int    = int(round(drowsy_score * 100))   # 0-100 fatigue score
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUDIO
-# ─────────────────────────────────────────────────────────────────────────────
+    prev_drowsy = (st.session_state.prev_status == "Drowsy")
+    if prev_drowsy:
+        is_drowsy = drowsy_score >= EXIT_DROWSY_FRAC    # easier to stay
+    else:
+        is_drowsy = drowsy_score >= ENTER_DROWSY_FRAC   # harder to enter
+
+    return ("Drowsy" if is_drowsy else "Awake"), score_int
+
 def _play_alert():
     now = time.time()
     if now - st.session_state.last_alert_time < ALERT_COOLDOWN_SEC:
-        return
+        return    # cooldown to prevent audio spam
     st.session_state.last_alert_time = now
     if AUDIO_BACKEND != "pygame":
         return
@@ -523,24 +493,18 @@ def _play_alert():
     except Exception:
         pass
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────────────────────────────────────────
 def _log(msg: str, level: str = "info"):
     ts     = time.strftime("%H:%M:%S")
     prefix = {"info": "ℹ", "ok": "✓", "warn": "⚠", "alert": "⚡"}.get(level, "•")
     st.session_state.log_lines.append((f"[{ts}]  {prefix}  {msg}", level))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CAMERA OPEN / CLOSE
-# ─────────────────────────────────────────────────────────────────────────────
 def _open_camera() -> bool:
     if st.session_state.cap is not None:
         st.session_state.cap.release()
         st.session_state.cap = None
 
     cap = None
-    for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
+    for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):   # try several backends
         try:
             cap = cv2.VideoCapture(0, backend)
             if cap.isOpened():
@@ -556,7 +520,7 @@ def _open_camera() -> bool:
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)   # always grab the latest frame
     st.session_state.cap = cap
     _log("Webcam opened successfully", "ok")
     return True
@@ -568,27 +532,30 @@ def _close_camera():
         st.session_state.cap = None
     _log("Webcam released — session ended", "info")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# START / STOP
-# ─────────────────────────────────────────────────────────────────────────────
 def start_detection():
     if st.session_state.running:
         return
-    st.session_state.frames_total    = 0
-    st.session_state.alerts_total    = 0
-    st.session_state.session_seconds = 0
-    st.session_state.log_lines       = []
-    st.session_state.fps             = 0.0
-    st.session_state.fps_counter     = 0
-    st.session_state.fps_t0          = time.perf_counter()
-    st.session_state.session_t0      = time.time()
-    st.session_state.start_time      = time.time()
-    st.session_state.drowsy_buffer   = deque(maxlen=SMOOTH_WINDOW)
-    st.session_state.last_ear        = None
-    st.session_state.last_ear_diff   = None
-    st.session_state.last_raw_label  = None
-    st.session_state.no_face_streak  = 0
-    st.session_state.prev_status     = "Idle"
+    st.session_state.frames_total         = 0
+    st.session_state.alerts_total         = 0
+    st.session_state.session_seconds      = 0
+    st.session_state.log_lines            = []
+    st.session_state.fps                  = 0.0
+    st.session_state.fps_counter          = 0
+    st.session_state.fps_t0               = time.perf_counter()
+    st.session_state.session_t0           = time.time()
+    st.session_state.start_time           = time.time()
+    st.session_state.drowsy_buffer        = deque(maxlen=SMOOTH_WINDOW)
+    st.session_state.last_ear             = None
+    st.session_state.last_ear_diff        = None
+    st.session_state.last_raw_label       = None
+    st.session_state.last_head_pose       = None
+    st.session_state.last_head_pose_rel   = None
+    st.session_state.head_off_streak      = 0
+    st.session_state.is_head_drowsy       = False
+    st.session_state.calibrating          = True
+    st.session_state.calibration_progress = 0.0
+    st.session_state.no_face_streak       = 0
+    st.session_state.prev_status          = "Idle"
 
     pipeline = get_pipeline()
     if pipeline is None:
@@ -598,12 +565,14 @@ def start_detection():
         )
         return
 
+    pipeline.reset_calibration()    # fresh head-pose baseline per session
+
     if not _open_camera():
         return
 
     st.session_state.running = True
-    st.session_state.status  = "Awake"
-    _log("Detection session started — SVM + MobileNetV2 ready", "ok")
+    st.session_state.status  = "Calibrating"
+    _log("Session started — calibrating neutral head pose…", "info")
 
 
 def stop_detection():
@@ -614,9 +583,6 @@ def stop_detection():
     st.session_state.fps           = 0.0
     _log("Detection stopped by user", "warn")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GRAB ONE FRAME
-# ─────────────────────────────────────────────────────────────────────────────
 def _grab_frame() -> Optional[str]:
     cap = st.session_state.cap
     if cap is None or not cap.isOpened():
@@ -630,7 +596,7 @@ def _grab_frame() -> Optional[str]:
         return None
 
     try:
-        status, score = _real_pipeline(frame)
+        status, score = _real_pipeline(frame)   # run inference
     except Exception as exc:
         status, score = "Error", 0
         _log(f"Pipeline exception: {exc}", "alert")
@@ -641,30 +607,29 @@ def _grab_frame() -> Optional[str]:
     st.session_state.frames_total   += 1
     st.session_state.session_seconds = int(time.time() - st.session_state.session_t0)
 
-    # Count an alert only on a fresh Awake → Drowsy transition, not every
-    # drowsy frame, so `alerts_total` reflects distinct drowsiness episodes.
-    if status == "Drowsy" and prev_status != "Drowsy":
-        st.session_state.alerts_total += 1
-        _log(f"Drowsiness detected (score {score})", "alert")
+    if prev_status == "Calibrating" and status != "Calibrating":
+        _log("Calibration complete — monitoring active", "ok")
+
+    if status == "Drowsy" and prev_status not in ("Drowsy", "Calibrating"):
+        st.session_state.alerts_total += 1   # only count fresh transitions
+        head_note = " (head + eyes)" if st.session_state.is_head_drowsy else ""
+        _log(f"Drowsiness detected (score {score}){head_note}", "alert")
 
     if status == "Drowsy":
-        _play_alert()  # internal cooldown prevents audio spam
+        _play_alert()
 
     st.session_state.prev_status = status
 
     st.session_state.fps_counter += 1
     elapsed = time.perf_counter() - st.session_state.fps_t0
-    if elapsed >= 1.0:
+    if elapsed >= 1.0:                                # update FPS every second
         st.session_state.fps         = round(st.session_state.fps_counter / elapsed, 1)
         st.session_state.fps_counter = 0
         st.session_state.fps_t0      = time.perf_counter()
 
-    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])  # encode for HTML
     return base64.b64encode(buf.tobytes()).decode()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 def _score_bar_css(score: int) -> str:
     if score < 35:
         return f"width:{score}%;background:linear-gradient(90deg,#00c97a,#00ffa3);"
@@ -699,11 +664,6 @@ def _placeholder_html() -> str:
     </div>"""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PANEL HTML BUILDERS
-# Pulled out so the live loop is a clean sequence of placeholder updates
-# instead of duplicated f-strings. Cheap to call (string formatting only).
-# ─────────────────────────────────────────────────────────────────────────────
 def _video_html(frame_b64: Optional[str], status: str, fps: float) -> str:
     if not frame_b64:
         return _placeholder_html()
@@ -721,18 +681,38 @@ def _video_html(frame_b64: Optional[str], status: str, fps: float) -> str:
 
 
 def _status_html(status: str) -> str:
-    is_drowsy   = status == "Drowsy"
-    is_awake    = status == "Awake"
-    status_css  = "status-drowsy" if is_drowsy else "status-awake" if is_awake else "status-idle"
-    status_icon = "⚠" if is_drowsy else "✓" if is_awake else "○"
-    pulse_cls   = "alert-active" if is_drowsy else ""
-    return f"""
-    <div class="hud-panel {pulse_cls}">
-        <div class="status-block">
-            <div class="status-eyebrow">DETECTION STATUS</div>
-            <div class="status-label {status_css}">{status_icon} {status.upper()}</div>
-        </div>
-    </div>"""
+    is_drowsy      = status == "Drowsy"
+    is_awake       = status == "Awake"
+    is_calibrating = status == "Calibrating"
+    status_css     = "status-drowsy" if is_drowsy else "status-awake" if is_awake else "status-idle"
+    status_icon    = "⚠" if is_drowsy else "✓" if is_awake else "◉" if is_calibrating else "○"
+    pulse_cls      = "alert-active" if is_drowsy else ""
+
+    extra = ""
+    if is_calibrating:
+        pct = int(round(st.session_state.calibration_progress * 100))
+        extra = (
+            '<div style="margin-top:14px;">'
+              '<div class="score-bar-bg">'
+                f'<div class="score-bar-fill" style="width:{pct}%;'
+                'background:linear-gradient(90deg,#4d9fff,#9b5fff);'
+                'box-shadow:0 0 12px rgba(155,95,255,0.4);"></div>'
+              '</div>'
+              '<div style="font-family:var(--f-mono);font-size:0.62rem;'
+              'letter-spacing:2px;color:var(--text3);margin-top:6px;'
+              f'text-align:center;">CALIBRATING NEUTRAL POSE · {pct}%</div>'
+            '</div>'
+        )
+
+    return (
+        f'<div class="hud-panel {pulse_cls}">'
+          '<div class="status-block">'
+            '<div class="status-eyebrow">DETECTION STATUS</div>'
+            f'<div class="status-label {status_css}">{status_icon} {status.upper()}</div>'
+            f'{extra}'
+          '</div>'
+        '</div>'
+    )
 
 
 def _score_html(score: int) -> str:
@@ -793,6 +773,23 @@ def _system_html() -> str:
     )
     raw_label = st.session_state.last_raw_label or "—"
 
+    rel = st.session_state.last_head_pose_rel
+    if rel is not None:
+        pitch_str = f"{rel[0]:+5.1f}°"
+        yaw_str   = f"{rel[1]:+5.1f}°"
+        roll_str  = f"{rel[2]:+5.1f}°"
+    else:
+        pitch_str = yaw_str = roll_str = "—"
+
+    if st.session_state.calibrating:
+        head_status, head_color = "CALIBRATING", "var(--blue)"
+    elif st.session_state.is_head_drowsy:
+        head_status, head_color = "OFF-AXIS", "var(--rose)"
+    elif st.session_state.head_off_streak > 0:
+        head_status, head_color = "DRIFTING", "var(--amber)"
+    else:
+        head_status, head_color = "ALIGNED", "var(--green)"
+
     return f"""
     <div class="hud-panel">
         <div style="font-family:var(--f-mono);font-size:0.72rem;color:var(--text2);line-height:2.2;">
@@ -805,7 +802,7 @@ def _system_html() -> str:
                 <span style="color:{model_color};font-weight:700;">{model_str}</span>
             </div>
             <div style="display:flex;justify-content:space-between;">
-                <span style="color:var(--text3);">RAW LABEL</span>
+                <span style="color:var(--text3);">EYE LABEL</span>
                 <span style="color:var(--violet);">{raw_label}</span>
             </div>
             <div style="display:flex;justify-content:space-between;">
@@ -815,6 +812,14 @@ def _system_html() -> str:
             <div style="display:flex;justify-content:space-between;">
                 <span style="color:var(--text3);">EAR DIFF</span>
                 <span style="color:var(--violet);">{ear_diff_str}</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;">
+                <span style="color:var(--text3);">HEAD</span>
+                <span style="color:{head_color};font-weight:700;">{head_status}</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;">
+                <span style="color:var(--text3);">PITCH / YAW / ROLL</span>
+                <span style="color:var(--violet);">{pitch_str} · {yaw_str} · {roll_str}</span>
             </div>
             <div style="display:flex;justify-content:space-between;">
                 <span style="color:var(--text3);">FPS</span>
@@ -839,23 +844,10 @@ def _log_html() -> str:
     ) or '<div style="color:var(--text3);">-- No events yet --</div>'
     return f'<div class="log-console">{body}</div>'
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RENDER
-#
-# The static layout (CSS, title, columns, section headers, buttons) is built
-# exactly once per Streamlit run. Everything that updates per-frame goes into
-# `st.empty()` placeholders that the live loop overwrites in-place. This is
-# the canonical Streamlit pattern for live video — calling `st.rerun()` after
-# every frame would re-emit the entire DOM and cause the slideshow effect the
-# user saw before.
-# ─────────────────────────────────────────────────────────────────────────────
 def render():
     st.markdown(CSS, unsafe_allow_html=True)
 
-    # Eagerly load the pipeline on first render so the user doesn't see a
-    # multi-second hang on their first START click. Cached, so subsequent
-    # reruns are instant.
-    if "pipeline_warmed" not in st.session_state:
+    if "pipeline_warmed" not in st.session_state:   # eager-load on first render
         get_pipeline()
         st.session_state.pipeline_warmed = True
         if _PIPELINE_LOAD_ERROR:
@@ -872,7 +864,6 @@ def render():
 
     col_video, col_dash = st.columns([3, 2], gap="large")
 
-    # ── LEFT — Video feed ──────────────────────────────────────────────────
     with col_video:
         st.markdown('<div class="sec-header">LIVE FEED</div>', unsafe_allow_html=True)
         video_slot = st.empty()
@@ -900,7 +891,6 @@ def render():
         st.markdown('<div class="sec-header">EVENT LOG</div>', unsafe_allow_html=True)
         log_slot = st.empty()
 
-    # ── RIGHT — Dashboard ──────────────────────────────────────────────────
     with col_dash:
         st.markdown('<div class="sec-header">DRIVER STATUS</div>', unsafe_allow_html=True)
         status_slot = st.empty()
@@ -917,9 +907,6 @@ def render():
         st.markdown('<div class="sec-header">SYSTEM</div>', unsafe_allow_html=True)
         system_slot = st.empty()
 
-    # ── Initial paint of every slot ────────────────────────────────────────
-    # This guarantees the layout looks correct before the loop starts and
-    # again after STOP (when running is False).
     video_slot.markdown(
         _video_html(None, st.session_state.status, st.session_state.fps),
         unsafe_allow_html=True,
@@ -930,21 +917,15 @@ def render():
     system_slot.markdown(_system_html(), unsafe_allow_html=True)
     log_slot.markdown(_log_html(), unsafe_allow_html=True)
 
-    # ── Live loop ──────────────────────────────────────────────────────────
-    # The loop owns the entire detection session: it grabs frames, runs the
-    # SVM/MobileNetV2 pipeline, and updates only the placeholders. Slow-
-    # changing panels are throttled so we don't waste render budget on data
-    # that barely moves at 30 Hz.
-    if st.session_state.running:
+    if st.session_state.running:        # live loop owns the session
         last_metrics_t = 0.0
         last_system_t  = 0.0
         last_log_count = -1
 
         while st.session_state.running:
-            frame_b64 = _grab_frame()
+            frame_b64 = _grab_frame()    # one frame -> inference -> b64
             now       = time.time()
 
-            # Per-frame: video + status + score (most visible to the driver).
             video_slot.markdown(
                 _video_html(frame_b64, st.session_state.status, st.session_state.fps),
                 unsafe_allow_html=True,
@@ -956,28 +937,20 @@ def render():
                 _score_html(st.session_state.fatigue_score), unsafe_allow_html=True
             )
 
-            # ~4 Hz: duration / frame counter / alert counter.
-            if now - last_metrics_t > 0.25:
+            if now - last_metrics_t > 0.25:    # ~4 Hz
                 metrics_slot.markdown(_metrics_html(), unsafe_allow_html=True)
                 last_metrics_t = now
 
-            # ~2 Hz: FPS / EAR / raw label / system info.
-            if now - last_system_t > 0.5:
+            if now - last_system_t > 0.5:      # ~2 Hz
                 system_slot.markdown(_system_html(), unsafe_allow_html=True)
                 last_system_t = now
 
-            # Only redraw the log when a new line has actually been added.
             log_count = len(st.session_state.log_lines)
-            if log_count != last_log_count:
+            if log_count != last_log_count:    # only redraw on change
                 log_slot.markdown(_log_html(), unsafe_allow_html=True)
                 last_log_count = log_count
 
-            # Tiny yield so the event loop can dispatch the STOP click.
-            # The pipeline itself is the real frame-rate cap (~10–25 Hz on CPU).
-            time.sleep(0.005)
+            time.sleep(0.005)   # yield to event loop
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
 render()
